@@ -8,6 +8,8 @@ Features:
 - Admin account auto-created on startup
 - Protected API endpoints with JWT tokens
 - Dashboard data endpoints for external frontend
+- Geofencing: 3-zone polygon configuration (Grazing, Neighbor Buffer, Restricted Area)
+- Alert logging for zone crossings and geofence violations
 
 Run: uvicorn main:app --host 0.0.0.0 --port 8000
 """
@@ -15,14 +17,14 @@ Run: uvicorn main:app --host 0.0.0.0 --port 8000
 import os
 import json
 from datetime import datetime, timedelta, timezone
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Depends, HTTPException, status, Request
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Boolean, desc, func
+from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Boolean, desc, func, Text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
 from jose import JWTError, jwt
@@ -79,6 +81,39 @@ class Device(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     last_seen = Column(DateTime, nullable=True)
     is_active = Column(Boolean, default=True)
+
+
+class GeofenceZone(Base):
+    """Stores geofence polygon coordinates as JSON string"""
+    __tablename__ = "geofence_zones"
+    id = Column(Integer, primary_key=True, index=True)
+    zone_id = Column(String, unique=True, index=True, nullable=False)  # grazing, neighbor, outside
+    name = Column(String, nullable=False)
+    color = Column(String, nullable=False)
+    coordinates_json = Column(Text, nullable=False, default="[]")
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    @property
+    def coordinates(self):
+        return json.loads(self.coordinates_json)
+
+    @coordinates.setter
+    def coordinates(self, value):
+        self.coordinates_json = json.dumps(value)
+
+
+class Alert(Base):
+    """Stores geofence violation and zone crossing events"""
+    __tablename__ = "alerts"
+    id = Column(Integer, primary_key=True, index=True)
+    device_id = Column(String, index=True, nullable=False)
+    device_name = Column(String, nullable=True)
+    zone = Column(String, nullable=False)  # e.g. "Outside Zone", "Grazing Zone", "Neighbor Buffer"
+    alert_type = Column(String, nullable=False, default="zone_crossing")  # zone_crossing, violation, entry, exit
+    latitude = Column(Float, nullable=False)
+    longitude = Column(Float, nullable=False)
+    timestamp = Column(DateTime, default=datetime.utcnow, index=True)
+    is_read = Column(Boolean, default=False)
 
 
 def get_db():
@@ -162,6 +197,59 @@ class DeviceHistoryResponse(BaseModel):
 
 
 # =============================================================================
+# GEOFENCE SCHEMAS
+# =============================================================================
+
+class ZoneData(BaseModel):
+    id: str
+    name: str
+    color: str
+    coordinates: List[List[float]]  # [[lat, lng], [lat, lng], ...]
+
+
+class GeofenceZonesResponse(BaseModel):
+    zones: Dict[str, ZoneData]
+
+
+class GeofenceZonesPayload(BaseModel):
+    zones: Dict[str, ZoneData]
+
+
+# =============================================================================
+# ALERT SCHEMAS
+# =============================================================================
+
+class AlertCreate(BaseModel):
+    device_id: str = Field(..., min_length=1, max_length=100)
+    device_name: Optional[str] = None
+    zone: str = Field(..., min_length=1)
+    timestamp: Optional[datetime] = None
+    latitude: float = Field(..., ge=-90, le=90)
+    longitude: float = Field(..., ge=-180, le=180)
+
+
+class AlertResponse(BaseModel):
+    id: int
+    device_id: str
+    device_name: Optional[str]
+    zone: str
+    alert_type: str
+    latitude: float
+    longitude: float
+    timestamp: datetime
+    is_read: bool
+
+    class Config:
+        from_attributes = True
+
+
+class AlertListResponse(BaseModel):
+    alerts: List[AlertResponse]
+    total: int
+    unread_count: int
+
+
+# =============================================================================
 # AUTHENTICATION UTILITIES
 # =============================================================================
 
@@ -240,11 +328,12 @@ async def get_current_active_admin(current_admin: Admin = Depends(get_current_ad
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Initialize database and create default admin on startup."""
+    """Initialize database and create default admin + geofences on startup."""
     Base.metadata.create_all(bind=engine)
 
     db = SessionLocal()
     try:
+        # Create default admin if none exists
         admin_count = db.query(Admin).count()
         if admin_count == 0:
             new_admin = Admin(
@@ -259,6 +348,20 @@ async def lifespan(app: FastAPI):
             print(f"  Password: {DEFAULT_ADMIN_PASS}")
             print(f"=" * 60)
             print(f"  WARNING: Change default credentials immediately!")
+            print(f"=" * 60)
+
+        # Create default geofence zones if none exist
+        zone_count = db.query(GeofenceZone).count()
+        if zone_count == 0:
+            default_zones = [
+                GeofenceZone(zone_id="grazing", name="Grazing Zone", color="#22c55e", coordinates_json="[]"),
+                GeofenceZone(zone_id="neighbor", name="Neighbor Buffer", color="#f59e0b", coordinates_json="[]"),
+                GeofenceZone(zone_id="outside", name="Restricted Area", color="#ef4444", coordinates_json="[]"),
+            ]
+            for zone in default_zones:
+                db.add(zone)
+            db.commit()
+            print(f"  Default geofence zones created (empty polygons)")
             print(f"=" * 60)
     finally:
         db.close()
@@ -275,8 +378,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="ESP32 GPS Tracker API",
-    description="Backend API for receiving GPS data from ESP32 devices with admin dashboard",
-    version="1.0.0",
+    description="Backend API for receiving GPS data from ESP32 devices with admin dashboard and geofencing",
+    version="1.1.0",
     lifespan=lifespan
 )
 
@@ -496,14 +599,211 @@ async def delete_device(
 
     # Delete GPS records for this device
     db.query(GPSData).filter(GPSData.device_id == device_id).delete()
+    # Delete alerts for this device
+    db.query(Alert).filter(Alert.device_id == device_id).delete()
     db.delete(device)
     db.commit()
     return {"message": f"Device {device_id} deleted successfully"}
 
 
 # =============================================================================
-# HEALTH CHECK
+# GEOFENCE ENDPOINTS (Admin only)
 # =============================================================================
+
+@app.get("/api/settings/geofences", response_model=GeofenceZonesResponse)
+async def get_geofences(
+    db: Session = Depends(get_db),
+    current_admin: Admin = Depends(get_current_active_admin)
+):
+    """
+    Retrieve saved geofence boundaries for all 3 zones.
+    Returns polygon coordinates for Grazing, Neighbor Buffer, and Restricted Area.
+    """
+    zones = db.query(GeofenceZone).all()
+
+    zone_dict = {}
+    for zone in zones:
+        zone_dict[zone.zone_id] = ZoneData(
+            id=zone.zone_id,
+            name=zone.name,
+            color=zone.color,
+            coordinates=zone.coordinates
+        )
+
+    # Ensure all 3 zones exist in response even if empty
+    for zone_id, default in [
+        ("grazing", ZoneData(id="grazing", name="Grazing Zone", color="#22c55e", coordinates=[])),
+        ("neighbor", ZoneData(id="neighbor", name="Neighbor Buffer", color="#f59e0b", coordinates=[])),
+        ("outside", ZoneData(id="outside", name="Restricted Area", color="#ef4444", coordinates=[])),
+    ]:
+        if zone_id not in zone_dict:
+            zone_dict[zone_id] = default
+
+    return GeofenceZonesResponse(zones=zone_dict)
+
+
+@app.post("/api/settings/geofences", response_model=GeofenceZonesResponse)
+async def save_geofences(
+    data: GeofenceZonesPayload,
+    db: Session = Depends(get_db),
+    current_admin: Admin = Depends(get_current_active_admin)
+):
+    """
+    Save geofence boundaries defined by the admin.
+    Accepts polygon coordinates for all 3 zones.
+    """
+    for zone_id, zone_data in data.zones.items():
+        zone = db.query(GeofenceZone).filter(GeofenceZone.zone_id == zone_id).first()
+
+        if zone:
+            zone.name = zone_data.name
+            zone.color = zone_data.color
+            zone.coordinates = zone_data.coordinates
+            zone.updated_at = datetime.utcnow()
+        else:
+            new_zone = GeofenceZone(
+                zone_id=zone_id,
+                name=zone_data.name,
+                color=zone_data.color,
+                coordinates_json=json.dumps(zone_data.coordinates)
+            )
+            db.add(new_zone)
+
+    db.commit()
+
+    # Return saved data
+    return await get_geofences(db, current_admin)
+
+
+# =============================================================================
+# ALERT ENDPOINTS (Admin only)
+# =============================================================================
+
+@app.post("/api/alerts", response_model=AlertResponse, status_code=status.HTTP_201_CREATED)
+async def create_alert(
+    data: AlertCreate,
+    db: Session = Depends(get_db),
+    current_admin: Admin = Depends(get_current_active_admin)
+):
+    """
+    Record a geofence violation or zone change event.
+    Called by frontend when a device crosses from one zone to another.
+    """
+    alert = Alert(
+        device_id=data.device_id,
+        device_name=data.device_name,
+        zone=data.zone,
+        alert_type="zone_crossing",
+        latitude=data.latitude,
+        longitude=data.longitude,
+        timestamp=data.timestamp or datetime.utcnow()
+    )
+    db.add(alert)
+    db.commit()
+    db.refresh(alert)
+    return alert
+
+
+@app.get("/api/alerts", response_model=AlertListResponse)
+async def get_alerts(
+    device_id: Optional[str] = None,
+    zone: Optional[str] = None,
+    limit: int = 50,
+    offset: int = 0,
+    unread_only: bool = False,
+    db: Session = Depends(get_db),
+    current_admin: Admin = Depends(get_current_active_admin)
+):
+    """
+    Get alert history with optional filtering.
+    Supports pagination and unread-only filtering.
+    """
+    query = db.query(Alert)
+
+    if device_id:
+        query = query.filter(Alert.device_id == device_id)
+    if zone:
+        query = query.filter(Alert.zone == zone)
+    if unread_only:
+        query = query.filter(Alert.is_read == False)
+
+    total = query.count()
+    unread_count = db.query(Alert).filter(Alert.is_read == False).count()
+
+    alerts = query.order_by(desc(Alert.timestamp)).offset(offset).limit(limit).all()
+
+    return AlertListResponse(
+        alerts=alerts,
+        total=total,
+        unread_count=unread_count
+    )
+
+
+@app.patch("/api/alerts/{alert_id}/read")
+async def mark_alert_read(
+    alert_id: int,
+    db: Session = Depends(get_db),
+    current_admin: Admin = Depends(get_current_active_admin)
+):
+    """Mark a single alert as read."""
+    alert = db.query(Alert).filter(Alert.id == alert_id).first()
+    if not alert:
+        raise HTTPException(status_code=404, detail="Alert not found")
+
+    alert.is_read = True
+    db.commit()
+    db.refresh(alert)
+    return alert
+
+
+@app.post("/api/alerts/read-all")
+async def mark_all_alerts_read(
+    db: Session = Depends(get_db),
+    current_admin: Admin = Depends(get_current_active_admin)
+):
+    """Mark all alerts as read."""
+    db.query(Alert).filter(Alert.is_read == False).update({"is_read": True})
+    db.commit()
+    return {"message": "All alerts marked as read"}
+
+
+@app.delete("/api/alerts/{alert_id}")
+async def delete_alert(
+    alert_id: int,
+    db: Session = Depends(get_db),
+    current_admin: Admin = Depends(get_current_active_admin)
+):
+    """Delete a single alert."""
+    alert = db.query(Alert).filter(Alert.id == alert_id).first()
+    if not alert:
+        raise HTTPException(status_code=404, detail="Alert not found")
+
+    db.delete(alert)
+    db.commit()
+    return {"message": f"Alert {alert_id} deleted"}
+
+
+# =============================================================================
+# ROOT & HEALTH CHECK
+# =============================================================================
+
+@app.get("/")
+async def root():
+    """Root endpoint - returns API info."""
+    return {
+        "name": "ESP32 GPS Tracker API",
+        "version": "1.1.0",
+        "features": ["gps_tracking", "admin_dashboard", "geofencing", "alerts"],
+        "endpoints": {
+            "gps": "POST /gps",
+            "login": "POST /api/auth/login",
+            "dashboard": "GET /api/dashboard/stats",
+            "geofences": "GET/POST /api/settings/geofences",
+            "alerts": "GET/POST /api/alerts",
+            "health": "GET /health"
+        }
+    }
+
 
 @app.get("/health")
 async def health_check():
