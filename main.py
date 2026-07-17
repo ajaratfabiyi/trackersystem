@@ -48,7 +48,7 @@ DEFAULT_ADMIN_PASS = os.getenv("DEFAULT_ADMIN_PASS", "admin123")
 CORS_ALLOWED_ORIGINS = [
     o.strip() for o in os.getenv(
         "CORS_ALLOWED_ORIGINS",
-        "https://cattle-gps-tracker-system.vercel.app/"
+        "https://cattle-gps-tracker-system.vercel.app"
     ).split(",") if o.strip()
 ]
 
