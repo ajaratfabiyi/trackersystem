@@ -10,6 +10,7 @@ Features:
 - Dashboard data endpoints for external frontend
 - Geofencing: 3-zone polygon configuration (Grazing, Neighbor Buffer, Restricted Area)
 - Alert logging for zone crossings and geofence violations
+- Device command queue: GET /command (device polls), POST /api/devices/{id}/command (admin queues)
 
 Run: uvicorn main:app --host 0.0.0.0 --port 8000
 """
@@ -33,7 +34,6 @@ from passlib.hash import argon2
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
-
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./gps_tracker.db")
 SECRET_KEY = os.getenv("SECRET_KEY", "change-this-secret-key-in-production-esp32-gps-tracker")
 ALGORITHM = "HS256"
@@ -42,10 +42,19 @@ ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24  # 24 hours
 DEFAULT_ADMIN_USER = os.getenv("DEFAULT_ADMIN_USER", "admin")
 DEFAULT_ADMIN_PASS = os.getenv("DEFAULT_ADMIN_PASS", "admin123")
 
+# CORS: list your actual frontend origin(s) here via env var (comma-separated),
+# or edit the default list directly. Wildcard "*" cannot be combined with
+# allow_credentials=True per the CORS spec, so this must be an explicit list.
+CORS_ALLOWED_ORIGINS = [
+    o.strip() for o in os.getenv(
+        "CORS_ALLOWED_ORIGINS",
+        "http://localhost:3000"
+    ).split(",") if o.strip()
+]
+
 # =============================================================================
 # DATABASE SETUP
 # =============================================================================
-
 engine = create_engine(
     DATABASE_URL,
     connect_args={"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
@@ -116,6 +125,19 @@ class Alert(Base):
     is_read = Column(Boolean, default=False)
 
 
+class DeviceCommand(Base):
+    """A single queued command for a device. Marked delivered once the device polls it."""
+    __tablename__ = "device_commands"
+    id = Column(Integer, primary_key=True, index=True)
+    device_id = Column(String, index=True, nullable=False)
+    command_type = Column(String, nullable=False, default="PLAY_SOUND")
+    file = Column(String, nullable=True)
+    volume = Column(Float, nullable=True, default=0.5)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    delivered = Column(Boolean, default=False)
+    delivered_at = Column(DateTime, nullable=True)
+
+
 def get_db():
     db = SessionLocal()
     try:
@@ -127,7 +149,6 @@ def get_db():
 # =============================================================================
 # PYDANTIC SCHEMAS
 # =============================================================================
-
 class GPSDataCreate(BaseModel):
     device_id: str = Field(..., min_length=1, max_length=100)
     latitude: float = Field(..., ge=-90, le=90)
@@ -199,7 +220,6 @@ class DeviceHistoryResponse(BaseModel):
 # =============================================================================
 # GEOFENCE SCHEMAS
 # =============================================================================
-
 class ZoneData(BaseModel):
     id: str
     name: str
@@ -218,7 +238,6 @@ class GeofenceZonesPayload(BaseModel):
 # =============================================================================
 # ALERT SCHEMAS
 # =============================================================================
-
 class AlertCreate(BaseModel):
     device_id: str = Field(..., min_length=1, max_length=100)
     device_name: Optional[str] = None
@@ -250,9 +269,30 @@ class AlertListResponse(BaseModel):
 
 
 # =============================================================================
+# DEVICE COMMAND SCHEMAS
+# =============================================================================
+class CommandCreate(BaseModel):
+    command_type: str = Field(default="PLAY_SOUND", max_length=32)
+    file: Optional[str] = Field(default="beep.wav", max_length=64)
+    volume: Optional[float] = Field(default=0.5, ge=0.0, le=1.0)
+
+
+class CommandResponse(BaseModel):
+    id: int
+    device_id: str
+    command_type: str
+    file: Optional[str]
+    volume: Optional[float]
+    created_at: datetime
+    delivered: bool
+
+    class Config:
+        from_attributes = True
+
+
+# =============================================================================
 # AUTHENTICATION UTILITIES
 # =============================================================================
-
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
 
 
@@ -325,7 +365,6 @@ async def get_current_active_admin(current_admin: Admin = Depends(get_current_ad
 # =============================================================================
 # STARTUP / LIFESPAN
 # =============================================================================
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Initialize database and create default admin + geofences on startup."""
@@ -342,13 +381,13 @@ async def lifespan(app: FastAPI):
             )
             db.add(new_admin)
             db.commit()
-            print(f"=" * 60)
-            print(f"  DEFAULT ADMIN CREATED")
+            print("=" * 60)
+            print("  DEFAULT ADMIN CREATED")
             print(f"  Username: {DEFAULT_ADMIN_USER}")
             print(f"  Password: {DEFAULT_ADMIN_PASS}")
-            print(f"=" * 60)
-            print(f"  WARNING: Change default credentials immediately!")
-            print(f"=" * 60)
+            print("=" * 60)
+            print("  WARNING: Change default credentials immediately!")
+            print("=" * 60)
 
         # Create default geofence zones if none exist
         zone_count = db.query(GeofenceZone).count()
@@ -361,8 +400,8 @@ async def lifespan(app: FastAPI):
             for zone in default_zones:
                 db.add(zone)
             db.commit()
-            print(f"  Default geofence zones created (empty polygons)")
-            print(f"=" * 60)
+            print("  Default geofence zones created (empty polygons)")
+            print("=" * 60)
     finally:
         db.close()
 
@@ -375,27 +414,25 @@ async def lifespan(app: FastAPI):
 # =============================================================================
 # FASTAPI APP
 # =============================================================================
-
 app = FastAPI(
     title="ESP32 GPS Tracker API",
     description="Backend API for receiving GPS data from ESP32 devices with admin dashboard and geofencing",
-    version="1.1.0",
+    version="1.2.0",
     lifespan=lifespan
 )
 
+# CORS: explicit origin list (required — wildcard + credentials is invalid per spec)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=CORS_ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-
 # =============================================================================
 # ESP32 GPS ENDPOINTS (No auth required - device sends data)
 # =============================================================================
-
 @app.post("/gps", status_code=status.HTTP_201_CREATED, response_model=GPSDataResponse)
 async def receive_gps_data(data: GPSDataCreate, db: Session = Depends(get_db)):
     """
@@ -428,9 +465,80 @@ async def receive_gps_data(data: GPSDataCreate, db: Session = Depends(get_db)):
 
 
 # =============================================================================
+# DEVICE COMMAND ENDPOINTS
+# =============================================================================
+@app.get("/command")
+async def get_pending_command(device_id: str, db: Session = Depends(get_db)):
+    """
+    Device-facing, no auth (matches /gps trust level). ESP32 firmware polls
+    this on an interval. Returns the oldest undelivered command for the
+    device, or {} if none is queued. Marked delivered immediately — the
+    firmware doesn't ack, so this is at-most-once delivery.
+    """
+    cmd = (
+        db.query(DeviceCommand)
+        .filter(DeviceCommand.device_id == device_id, DeviceCommand.delivered == False)
+        .order_by(DeviceCommand.created_at.asc())
+        .first()
+    )
+    if not cmd:
+        return {}
+
+    cmd.delivered = True
+    cmd.delivered_at = datetime.utcnow()
+    db.commit()
+
+    return {
+        "type": cmd.command_type,
+        "file": cmd.file,
+        "volume": cmd.volume,
+    }
+
+
+@app.post("/api/devices/{device_id}/command", response_model=CommandResponse, status_code=status.HTTP_201_CREATED)
+async def queue_device_command(
+    device_id: str,
+    data: CommandCreate,
+    db: Session = Depends(get_db),
+    current_admin: Admin = Depends(get_current_active_admin)
+):
+    """Queue a command (e.g. PLAY_SOUND) for a device from the admin dashboard."""
+    device = db.query(Device).filter(Device.device_id == device_id).first()
+    if not device:
+        raise HTTPException(status_code=404, detail="Device not found")
+
+    cmd = DeviceCommand(
+        device_id=device_id,
+        command_type=data.command_type,
+        file=data.file,
+        volume=data.volume,
+    )
+    db.add(cmd)
+    db.commit()
+    db.refresh(cmd)
+    return cmd
+
+
+@app.get("/api/devices/{device_id}/commands", response_model=List[CommandResponse])
+async def get_device_commands(
+    device_id: str,
+    limit: int = 20,
+    db: Session = Depends(get_db),
+    current_admin: Admin = Depends(get_current_active_admin)
+):
+    """View recent commands (and delivery status) queued for a device."""
+    return (
+        db.query(DeviceCommand)
+        .filter(DeviceCommand.device_id == device_id)
+        .order_by(DeviceCommand.created_at.desc())
+        .limit(limit)
+        .all()
+    )
+
+
+# =============================================================================
 # AUTHENTICATION ENDPOINTS
 # =============================================================================
-
 @app.post("/api/auth/login", response_model=Token)
 async def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
     """Admin login - returns JWT token for dashboard access."""
@@ -477,7 +585,6 @@ async def get_current_admin_info(current_admin: Admin = Depends(get_current_acti
 # =============================================================================
 # DASHBOARD DATA ENDPOINTS (Admin only)
 # =============================================================================
-
 @app.get("/api/dashboard/stats", response_model=DashboardStats)
 async def get_dashboard_stats(
     db: Session = Depends(get_db),
@@ -539,7 +646,6 @@ async def get_device_gps_history(
 # =============================================================================
 # DEVICE MANAGEMENT ENDPOINTS (Admin only)
 # =============================================================================
-
 @app.get("/api/devices", response_model=List[DeviceResponse])
 async def get_devices(
     db: Session = Depends(get_db),
@@ -601,6 +707,8 @@ async def delete_device(
     db.query(GPSData).filter(GPSData.device_id == device_id).delete()
     # Delete alerts for this device
     db.query(Alert).filter(Alert.device_id == device_id).delete()
+    # Delete queued commands for this device
+    db.query(DeviceCommand).filter(DeviceCommand.device_id == device_id).delete()
     db.delete(device)
     db.commit()
     return {"message": f"Device {device_id} deleted successfully"}
@@ -609,7 +717,6 @@ async def delete_device(
 # =============================================================================
 # GEOFENCE ENDPOINTS (Admin only)
 # =============================================================================
-
 @app.get("/api/settings/geofences", response_model=GeofenceZonesResponse)
 async def get_geofences(
     db: Session = Depends(get_db),
@@ -678,7 +785,6 @@ async def save_geofences(
 # =============================================================================
 # ALERT ENDPOINTS (Admin only)
 # =============================================================================
-
 @app.post("/api/alerts", response_model=AlertResponse, status_code=status.HTTP_201_CREATED)
 async def create_alert(
     data: AlertCreate,
@@ -786,16 +892,17 @@ async def delete_alert(
 # =============================================================================
 # ROOT & HEALTH CHECK
 # =============================================================================
-
 @app.get("/")
 async def root():
     """Root endpoint - returns API info."""
     return {
         "name": "ESP32 GPS Tracker API",
-        "version": "1.1.0",
-        "features": ["gps_tracking", "admin_dashboard", "geofencing", "alerts"],
+        "version": "1.2.0",
+        "features": ["gps_tracking", "admin_dashboard", "geofencing", "alerts", "device_commands"],
         "endpoints": {
             "gps": "POST /gps",
+            "command_poll": "GET /command",
+            "command_queue": "POST /api/devices/{device_id}/command",
             "login": "POST /api/auth/login",
             "dashboard": "GET /api/dashboard/stats",
             "geofences": "GET/POST /api/settings/geofences",
@@ -814,7 +921,6 @@ async def health_check():
 # =============================================================================
 # MAIN
 # =============================================================================
-
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
