@@ -471,7 +471,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="ESP32 GPS Tracker API",
     description="Backend API for receiving GPS data from ESP32 devices with admin dashboard and geofencing",
-    version="1.4.0",
+    version="1.4.1",
     lifespan=lifespan
 )
 
@@ -976,7 +976,7 @@ async def root():
     """Root endpoint - returns API info."""
     return {
         "name": "ESP32 GPS Tracker API",
-        "version": "1.4.0",
+        "version": "1.4.1",
         "features": ["gps_tracking", "admin_dashboard", "geofencing", "alerts", "device_commands"],
         "endpoints": {
             "gps": "POST /gps",
@@ -991,10 +991,33 @@ async def root():
     }
 
 
+@app.head("/")
+async def root_head():
+    """
+    Explicit HEAD handler for '/'.
+
+    Platform health checks (e.g. Render) commonly probe the root path with
+    HEAD rather than GET. Starlette's automatic GET->HEAD fallback isn't
+    reliably present across all versions, so without this the probe hits
+    a route that exists (GET /) but doesn't accept HEAD, and gets back a
+    405 Method Not Allowed — which can lead the platform to treat the
+    service as unhealthy and cycle/restart it. Returning an empty 200
+    response here fixes that regardless of framework-version behavior.
+    """
+    return {}
+
+
 @app.get("/health")
 async def health_check():
     """Health check endpoint."""
     return {"status": "healthy", "timestamp": datetime.utcnow().isoformat()}
+
+
+@app.head("/health")
+async def health_check_head():
+    """HEAD counterpart to /health, for the same reason as HEAD / above —
+    in case a health check probe targets this path with HEAD instead."""
+    return {}
 
 
 # =============================================================================
