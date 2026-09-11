@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: esp32-gps-tracker
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11"
+      - key: SECRET_KEY
+        generateValue: true
+      # Set this in the Render dashboard to your Supabase project's
+      # Postgres connection string (Settings -> Database -> Connection
+      # string -> Session pooler recommended for a long-lived service
+      # like this one). `sync: false` keeps it out of this file.
+      - key: DATABASE_URL
+        sync: false

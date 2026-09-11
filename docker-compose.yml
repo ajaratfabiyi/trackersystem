@@ -1,0 +1,25 @@
+services:
+  api:
+    build: .
+    container_name: esp32-gps-tracker
+    ports:
+      - "8000:8000"
+    environment:
+      PORT: 8000
+      # Required: your Supabase project's Postgres connection string
+      # (Settings -> Database -> Connection string). No default is
+      # provided on purpose — the app refuses to start without it.
+      # Put it in a local .env file (see .env.example) rather than
+      # committing it here.
+      DATABASE_URL: ${DATABASE_URL:?Set DATABASE_URL to your Supabase connection string, e.g. in a .env file}
+      SECRET_KEY: ${SECRET_KEY:-change-this-secret-key-in-production-esp32-gps-tracker}
+      DEFAULT_ADMIN_USER: ${DEFAULT_ADMIN_USER:-admin}
+      DEFAULT_ADMIN_PASS: ${DEFAULT_ADMIN_PASS:-admin123}
+      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-https://cattle-gps-tracker-system.vercel.app}
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
